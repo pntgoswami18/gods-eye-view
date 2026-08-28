@@ -134,6 +134,12 @@ export const DATA_CREDITS = [
       '<a href="https://webcams.nyctmc.org" target="_blank" rel="noopener">webcams.nyctmc.org</a>',
   },
   {
+    key: 'toronto-cctv',
+    html:
+      'CCTV cameras &amp; frames (Toronto): City of Toronto — ' +
+      '<a href="https://open.toronto.ca/dataset/traffic-cameras/" target="_blank" rel="noopener">open.toronto.ca</a>',
+  },
+  {
     key: 'gbfs',
     html: 'Bikeshare availability: GBFS operator feeds (e.g. Austin BCycle)',
   },

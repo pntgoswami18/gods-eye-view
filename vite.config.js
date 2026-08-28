@@ -3447,7 +3447,14 @@ const NYC_TMC_CAMERAS_URL = 'https://webcams.nyctmc.org/api/cameras';
 const NYC_TMC_IMAGE_ORIGIN = 'https://webcams.nyctmc.org/';
 const DEFAULT_NYC_MAX_SOURCES = 250;
 const NYC_CENTER = { lat: 40.7580, lon: -73.9855 }; // Times Square
-/** Camera CATALOGS change rarely; 15 min keeps multi-megabyte upstream list refetches (Austin rows.json + 4 Caltrans districts + TfL + NYC DOT) infrequent. Frames are fetched per-request and are unaffected. */
+/** Toronto TMC cameras: one keyless JSONP list endpoint (no status field —
+ * every listed camera is treated as live); frames are built per-number on
+ * the city's own web host, not the open-data host. */
+const TORONTO_CAMERAS_URL = 'https://opendata.toronto.ca/transportation/tmc/rescucameraimages/Data/tmcearthcameras.json';
+const TORONTO_IMAGE_ORIGIN = 'https://www.toronto.ca/data/transportation/roadrestrictions/CameraImages/';
+const DEFAULT_TORONTO_MAX_SOURCES = 250;
+const TORONTO_CENTER = { lat: 43.6532, lon: -79.3832 }; // Downtown Toronto
+/** Camera CATALOGS change rarely; 15 min keeps multi-megabyte upstream list refetches (Austin rows.json + 4 Caltrans districts + TfL + NYC DOT + Toronto) infrequent. Frames are fetched per-request and are unaffected. */
 const CCTV_SOURCE_CACHE_MS = 15 * 60 * 1000;
 /** Per-provider catalog-fetch timeout. Bounds the worst-case refresh so one
  * stalled upstream can't leave getCctvSources (and thus every CCTV route)
@@ -4144,6 +4151,82 @@ async function loadNycSourcesFromOpenData() {
 }
 
 /**
+ * Fetch Toronto TMC traffic cameras. Keyless: one list endpoint, wrapped in a
+ * JSONP callback (`jsonTMCEarthCamerasCallback(...)`) rather than plain JSON,
+ * so the body is unwrapped by regex before parsing. The catalog carries no
+ * per-camera status field, so every listed camera is treated as live (same
+ * open-by-default posture as TfL's `available` flag, just without one to
+ * check). Frame URLs are built from the camera number against the city's own
+ * web host — not the open-data host the catalog was fetched from.
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+async function loadTorontoSourcesFromOpenData() {
+  try {
+    const resp = await fetch(TORONTO_CAMERAS_URL, { headers: { Accept: 'text/javascript' }, signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS) });
+    if (!resp.ok) {
+      console.warn('[CCTV] Toronto source download failed:', resp.status);
+      return [];
+    }
+    const body = await resp.text();
+    const match = /\((\{.*\})\)\s*;?\s*$/s.exec(body.trim());
+    if (!match) {
+      console.warn('[CCTV] Toronto source payload was not JSONP-shaped as expected');
+      return [];
+    }
+    const payload = JSON.parse(match[1]);
+    const records = Array.isArray(payload?.Data) ? payload.Data : [];
+
+    const cameras = [];
+    for (const record of records) {
+      const lat = toFiniteNumber(record?.Latitude);
+      const lon = toFiniteNumber(record?.Longitude);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+
+      const rawId = String(record?.Number || '').trim();
+      if (!rawId) continue;
+      const cameraId = `toronto-${rawId}`;
+      const imageUrl = `${TORONTO_IMAGE_ORIGIN}loc${encodeURIComponent(rawId)}.jpg`;
+
+      cameras.push({
+        id: cameraId,
+        name: String(record?.Name || `Toronto TMC Camera ${rawId}`),
+        city: 'Toronto',
+        cityId: 'toronto',
+        provider: 'City of Toronto',
+        lat,
+        lon,
+        // The catalog lists which compass directions the camera covers (D1-D4)
+        // rather than a single mount heading, so this falls back to the same
+        // id-hash prior as other headingless packs (TfL, NYC).
+        headingDeg: fallbackHeadingFromId(cameraId),
+        headingConfidence: 'low',
+        pitchDeg: -18,
+        fovDeg: 44,
+        rangeM: 145,
+        mountHeightM: 8,
+        groundElevationM: 90, // Toronto's downtown core sits ~75-110m ASL; one-shot snap corrects.
+        feedType: 'image',
+        url: imageUrl,
+        snapshotUrl: imageUrl,
+        sourceKind: 'toronto-open-data',
+        license: 'Public City of Toronto traffic camera frame',
+      });
+    }
+
+    const unique = Array.from(new Map(cameras.map((camera) => [camera.id, camera])).values());
+    const maxRaw = Number(process.env.CCTV_TORONTO_MAX_SOURCES || DEFAULT_TORONTO_MAX_SOURCES);
+    const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(600, Math.floor(maxRaw))) : DEFAULT_TORONTO_MAX_SOURCES;
+    const prioritized = prioritizeSources(unique, maxCount, [TORONTO_CENTER]);
+    console.log(`[CCTV] Loaded Toronto camera sources: ${unique.length} (using nearest ${prioritized.length})`);
+    return prioritized;
+  } catch (error) {
+    console.warn('[CCTV] Toronto source download error:', error?.message || error);
+    return [];
+  }
+}
+
+/**
  * Normalize a raw CCTV source item into a canonical shape with safe defaults.
  *
  * @param {object} item - Raw source from file, env, or Austin Open Data.
@@ -4182,7 +4265,7 @@ function normalizeSourceItem(item) {
 /**
  * Assemble and cache the merged CCTV source list.
  *
- * Merges sources from live open-data packs (Austin, Caltrans, TfL, NYC DOT),
+ * Merges sources from live open-data packs (Austin, Caltrans, TfL, NYC DOT, Toronto),
  * a local file, and an env variable, deduplicates by ID, applies the global
  * max cap, and caches for CCTV_SOURCE_CACHE_MS.
  *
@@ -4220,25 +4303,29 @@ async function refreshCctvSources() {
   const needsLiveSources = forceAustin || ((fromFile.length + fromEnv.length) === 0 && preferAustin);
   const tflEnabled = String(process.env.CCTV_TFL_ENABLED || '1').trim() !== '0';
   const nycEnabled = String(process.env.CCTV_NYC_ENABLED || '1').trim() !== '0';
+  const torontoEnabled = String(process.env.CCTV_TORONTO_ENABLED || '1').trim() !== '0';
 
   let fromAustin = [];
   let fromCaltrans = [];
   let fromTfl = [];
   let fromNyc = [];
+  let fromToronto = [];
   if (needsLiveSources) {
-    const [austinResult, caltransResult, tflResult, nycResult] = await Promise.allSettled([
+    const [austinResult, caltransResult, tflResult, nycResult, torontoResult] = await Promise.allSettled([
       loadAustinSourcesFromOpenData(),
       loadCaltransSourcesFromOpenData(),
       tflEnabled ? loadTflSourcesFromOpenData() : Promise.resolve([]),
       nycEnabled ? loadNycSourcesFromOpenData() : Promise.resolve([]),
+      torontoEnabled ? loadTorontoSourcesFromOpenData() : Promise.resolve([]),
     ]);
     fromAustin = austinResult.status === 'fulfilled' ? austinResult.value : [];
     fromCaltrans = caltransResult.status === 'fulfilled' ? caltransResult.value : [];
     fromTfl = tflResult.status === 'fulfilled' ? tflResult.value : [];
     fromNyc = nycResult.status === 'fulfilled' ? nycResult.value : [];
+    fromToronto = torontoResult.status === 'fulfilled' ? torontoResult.value : [];
   }
   // Live sources first so file/env overrides win on duplicate IDs (Map last-write).
-  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromNyc, ...fromFile, ...fromEnv];
+  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromNyc, ...fromToronto, ...fromFile, ...fromEnv];
 
   // Deduplicate by camera ID (last-write wins because of Map.set)
   const byId = new Map();
