@@ -3418,8 +3418,12 @@ const DEFAULT_CCTV_SOURCE_FILE = 'config/cctv_sources.austin.json';
 const DEFAULT_AUSTIN_ROWS_URL = 'https://data.austintexas.gov/api/views/b4k4-adkb/rows.json?accessType=DOWNLOAD';
 /** Default cap on Austin cameras after distance-based prioritization. */
 const DEFAULT_AUSTIN_MAX_SOURCES = 250;
-/** Global cap on total CCTV sources served by the proxy. */
-const DEFAULT_CCTV_MAX_SOURCES = 900;
+/** Global cap on total CCTV sources served by the proxy. Sized to the
+ * HEALTH_MAX_ENTRIES ceiling in cctvProxy() (1200) now that six live packs
+ * (Austin, Caltrans, TfL, NYC, Toronto, Seattle) can each contribute up to
+ * ~250-300 cameras — a lower cap would silently drop whichever packs merge
+ * last (see refreshCctvSources' pack ordering) rather than trimming evenly. */
+const DEFAULT_CCTV_MAX_SOURCES = 1200;
 /** Reference point for Austin camera prioritization (Congress & 6th). */
 const AUSTIN_DOWNTOWN = { lat: 30.2672, lon: -97.7431 };
 /** Caltrans CCTV: one JSON feed per district, identical schema statewide. */
@@ -3454,7 +3458,14 @@ const TORONTO_CAMERAS_URL = 'https://opendata.toronto.ca/transportation/tmc/resc
 const TORONTO_IMAGE_ORIGIN = 'https://www.toronto.ca/data/transportation/roadrestrictions/CameraImages/';
 const DEFAULT_TORONTO_MAX_SOURCES = 250;
 const TORONTO_CENTER = { lat: 43.6532, lon: -79.3832 }; // Downtown Toronto
-/** Camera CATALOGS change rarely; 15 min keeps multi-megabyte upstream list refetches (Austin rows.json + 4 Caltrans districts + TfL + NYC DOT + Toronto) infrequent. Frames are fetched per-request and are unaffected. */
+/** Seattle SDOT cameras: one keyless ArcGIS FeatureServer query returns
+ * catalog AND a per-camera absolute image URL in the same response (unlike
+ * every other pack here, no separate image-host construction needed). */
+const SEATTLE_CAMERAS_URL = 'https://services.arcgis.com/ZOyb2t4B0UYuYNYH/arcgis/rest/services/Traffic_Cameras_CDL/FeatureServer/0/query?where=1%3D1&outFields=UNITID,NAME,URL,SERVSTAT&outSR=4326&f=json&returnGeometry=true';
+const SEATTLE_IMAGE_ORIGIN = 'https://www.seattle.gov/trafficcams/';
+const DEFAULT_SEATTLE_MAX_SOURCES = 250;
+const SEATTLE_CENTER = { lat: 47.6062, lon: -122.3321 }; // Downtown Seattle
+/** Camera CATALOGS change rarely; 15 min keeps multi-megabyte upstream list refetches (Austin rows.json + 4 Caltrans districts + TfL + NYC DOT + Toronto + Seattle) infrequent. Frames are fetched per-request and are unaffected. */
 const CCTV_SOURCE_CACHE_MS = 15 * 60 * 1000;
 /** Per-provider catalog-fetch timeout. Bounds the worst-case refresh so one
  * stalled upstream can't leave getCctvSources (and thus every CCTV route)
@@ -4227,6 +4238,80 @@ async function loadTorontoSourcesFromOpenData() {
 }
 
 /**
+ * Fetch Seattle SDOT traffic cameras. Keyless: one ArcGIS FeatureServer query
+ * returns the catalog with an absolute per-camera image URL already
+ * populated (like NYC, unlike Austin/Caltrans/Toronto). Only `SERVSTAT ===
+ * 'ACTV'` cameras with finite coords and an image URL on the official host
+ * are kept.
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+async function loadSeattleSourcesFromOpenData() {
+  try {
+    const resp = await fetch(SEATTLE_CAMERAS_URL, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS) });
+    if (!resp.ok) {
+      console.warn('[CCTV] Seattle source download failed:', resp.status);
+      return [];
+    }
+    const payload = await resp.json();
+    const features = Array.isArray(payload?.features) ? payload.features : [];
+
+    const cameras = [];
+    for (const feature of features) {
+      const attrs = feature?.attributes || {};
+      if (String(attrs.SERVSTAT || '').toUpperCase() !== 'ACTV') continue;
+
+      const lat = toFiniteNumber(feature?.geometry?.y);
+      const lon = toFiniteNumber(feature?.geometry?.x);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+
+      // Upstream serves URL as http://; upgrade to https:// before the
+      // official-host pin so the proxy never makes a plaintext request.
+      const imageUrl = String(attrs.URL || '').replace(/^http:\/\//, 'https://');
+      if (!imageUrl.startsWith(SEATTLE_IMAGE_ORIGIN)) continue; // official-host pin
+
+      const rawId = String(attrs.UNITID || '').trim();
+      if (!rawId) continue;
+      const cameraId = `sea-${rawId}`;
+
+      cameras.push({
+        id: cameraId,
+        name: String(attrs.NAME || `Seattle SDOT Camera ${rawId}`).replace(/\.jpg$/i, '').replace(/_/g, ' '),
+        city: 'Seattle',
+        cityId: 'seattle',
+        provider: 'Seattle DOT',
+        lat,
+        lon,
+        // No heading signal in the SDOT feed → id-hash fallback, low
+        // confidence personality (same as headingless NYC/TfL cameras).
+        headingDeg: fallbackHeadingFromId(cameraId),
+        headingConfidence: 'low',
+        pitchDeg: -18,
+        fovDeg: 44,
+        rangeM: 145,
+        mountHeightM: 8,
+        groundElevationM: 20, // Seattle's core sits roughly 0-70m ASL; one-shot snap corrects.
+        feedType: 'image',
+        url: imageUrl,
+        snapshotUrl: imageUrl,
+        sourceKind: 'seattle-open-data',
+        license: 'Public Seattle DOT traffic camera frame',
+      });
+    }
+
+    const unique = Array.from(new Map(cameras.map((camera) => [camera.id, camera])).values());
+    const maxRaw = Number(process.env.CCTV_SEATTLE_MAX_SOURCES || DEFAULT_SEATTLE_MAX_SOURCES);
+    const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(600, Math.floor(maxRaw))) : DEFAULT_SEATTLE_MAX_SOURCES;
+    const prioritized = prioritizeSources(unique, maxCount, [SEATTLE_CENTER]);
+    console.log(`[CCTV] Loaded Seattle camera sources: ${unique.length} active (using nearest ${prioritized.length})`);
+    return prioritized;
+  } catch (error) {
+    console.warn('[CCTV] Seattle source download error:', error?.message || error);
+    return [];
+  }
+}
+
+/**
  * Normalize a raw CCTV source item into a canonical shape with safe defaults.
  *
  * @param {object} item - Raw source from file, env, or Austin Open Data.
@@ -4265,7 +4350,7 @@ function normalizeSourceItem(item) {
 /**
  * Assemble and cache the merged CCTV source list.
  *
- * Merges sources from live open-data packs (Austin, Caltrans, TfL, NYC DOT, Toronto),
+ * Merges sources from live open-data packs (Austin, Caltrans, TfL, NYC DOT, Toronto, Seattle),
  * a local file, and an env variable, deduplicates by ID, applies the global
  * max cap, and caches for CCTV_SOURCE_CACHE_MS.
  *
@@ -4304,28 +4389,32 @@ async function refreshCctvSources() {
   const tflEnabled = String(process.env.CCTV_TFL_ENABLED || '1').trim() !== '0';
   const nycEnabled = String(process.env.CCTV_NYC_ENABLED || '1').trim() !== '0';
   const torontoEnabled = String(process.env.CCTV_TORONTO_ENABLED || '1').trim() !== '0';
+  const seattleEnabled = String(process.env.CCTV_SEATTLE_ENABLED || '1').trim() !== '0';
 
   let fromAustin = [];
   let fromCaltrans = [];
   let fromTfl = [];
   let fromNyc = [];
   let fromToronto = [];
+  let fromSeattle = [];
   if (needsLiveSources) {
-    const [austinResult, caltransResult, tflResult, nycResult, torontoResult] = await Promise.allSettled([
+    const [austinResult, caltransResult, tflResult, nycResult, torontoResult, seattleResult] = await Promise.allSettled([
       loadAustinSourcesFromOpenData(),
       loadCaltransSourcesFromOpenData(),
       tflEnabled ? loadTflSourcesFromOpenData() : Promise.resolve([]),
       nycEnabled ? loadNycSourcesFromOpenData() : Promise.resolve([]),
       torontoEnabled ? loadTorontoSourcesFromOpenData() : Promise.resolve([]),
+      seattleEnabled ? loadSeattleSourcesFromOpenData() : Promise.resolve([]),
     ]);
     fromAustin = austinResult.status === 'fulfilled' ? austinResult.value : [];
     fromCaltrans = caltransResult.status === 'fulfilled' ? caltransResult.value : [];
     fromTfl = tflResult.status === 'fulfilled' ? tflResult.value : [];
     fromNyc = nycResult.status === 'fulfilled' ? nycResult.value : [];
     fromToronto = torontoResult.status === 'fulfilled' ? torontoResult.value : [];
+    fromSeattle = seattleResult.status === 'fulfilled' ? seattleResult.value : [];
   }
   // Live sources first so file/env overrides win on duplicate IDs (Map last-write).
-  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromNyc, ...fromToronto, ...fromFile, ...fromEnv];
+  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromNyc, ...fromToronto, ...fromSeattle, ...fromFile, ...fromEnv];
 
   // Deduplicate by camera ID (last-write wins because of Map.set)
   const byId = new Map();

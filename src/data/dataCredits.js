@@ -140,6 +140,12 @@ export const DATA_CREDITS = [
       '<a href="https://open.toronto.ca/dataset/traffic-cameras/" target="_blank" rel="noopener">open.toronto.ca</a>',
   },
   {
+    key: 'seattle-cctv',
+    html:
+      'CCTV cameras &amp; frames (Seattle): Seattle DOT — ' +
+      '<a href="https://data-seattlecitygis.opendata.arcgis.com/" target="_blank" rel="noopener">Seattle GeoData</a>',
+  },
+  {
     key: 'gbfs',
     html: 'Bikeshare availability: GBFS operator feeds (e.g. Austin BCycle)',
   },
