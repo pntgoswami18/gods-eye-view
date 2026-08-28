@@ -460,6 +460,21 @@ function googleRateLimiter() {
 }
 
 /**
+ * API key for server-to-server Google calls (Geocoding, Places (New)).
+ * Prefers GOOGLE_SERVER_API_KEY, a key deliberately kept separate from
+ * GOOGLE_MAPS_API_KEY: Google's Geocoding API refuses HTTP-referrer-restricted
+ * keys outright, and Places (New) enforces its referrer restriction even on a
+ * server-side call carrying no browser Referer header — so the client-exposed,
+ * referrer-restricted Map Tiles key (GOOGLE_MAPS_API_KEY) cannot serve these
+ * two proxies. Falls back to GOOGLE_MAPS_API_KEY for setups that leave it
+ * unrestricted (an unrestricted key works fine as a single key for everything).
+ * @returns {string|undefined}
+ */
+function googleServerApiKey() {
+  return process.env.GOOGLE_SERVER_API_KEY || process.env.GOOGLE_MAPS_API_KEY;
+}
+
+/**
  * Apply an opt-in limiter to a request, writing a 429 when over the cap.
  * When `limiter` is null (unlimited, the default) this is a no-op returning
  * `true`, so the handler proceeds exactly as before.
@@ -5293,7 +5308,7 @@ function googlePlacesContextProxy() {
         return;
       }
 
-      const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+      const apiKey = googleServerApiKey();
       if (!apiKey) {
         res.statusCode = 503;
         res.setHeader('Content-Type', 'application/json');
@@ -5407,7 +5422,7 @@ function googlePlacesContextProxy() {
         return;
       }
 
-      const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+      const apiKey = googleServerApiKey();
       if (!apiKey) {
         res.statusCode = 503;
         res.setHeader('Content-Type', 'application/json');
@@ -5496,6 +5511,70 @@ function googlePlacesContextProxy() {
         res.statusCode = 502;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.end(JSON.stringify({ error: error?.message || 'Google Places request failed', places: [] }));
+      }
+    });
+
+    // Geocoding: resolve a free-text location search. Google's Geocoding API
+    // rejects HTTP-referrer-restricted keys outright ("API keys with referer
+    // restrictions cannot be used with this API") — it only accepts IP or
+    // unrestricted keys, unlike the client-side Map Tiles/JS APIs. Proxying
+    // server-side (same key, same as nearby-places/text-search above) lets
+    // the client-exposed key stay referrer-restricted for Map Tiles while
+    // this call is made with the server's own IP, which Google always allows
+    // regardless of the key's restriction mode. Response is Google's raw
+    // geocode JSON shape (status/results/error_message) so the caller's
+    // existing `data.status === 'OK'` handling needs no change.
+    middlewares.use('/api/google/geocode', async (req, res) => {
+      if (req.method !== 'GET') {
+        res.statusCode = 405;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ status: 'INVALID_REQUEST', error_message: 'Method not allowed', results: [] }));
+        return;
+      }
+
+      const _grl = googleRateLimiter();
+      if (_grl && !_grl(clientKey(req))) {
+        res.statusCode = 429;
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Retry-After', '5');
+        res.end(JSON.stringify({ status: 'OVER_QUERY_LIMIT', error_message: 'Rate limit exceeded', results: [] }));
+        return;
+      }
+
+      const apiKey = googleServerApiKey();
+      if (!apiKey) {
+        res.statusCode = 503;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ status: 'REQUEST_DENIED', error_message: 'GOOGLE_MAPS_API_KEY is not set', results: [] }));
+        return;
+      }
+
+      const requestUrl = new URL(req.url || '', 'http://localhost');
+      const address = String(requestUrl.searchParams.get('address') || '').trim();
+      const bounds = String(requestUrl.searchParams.get('bounds') || '').trim();
+      if (!address) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ status: 'INVALID_REQUEST', error_message: 'address is required', results: [] }));
+        return;
+      }
+
+      try {
+        const upstream = new URL('https://maps.googleapis.com/maps/api/geocode/json');
+        upstream.searchParams.set('address', address);
+        upstream.searchParams.set('key', apiKey);
+        if (bounds) upstream.searchParams.set('bounds', bounds);
+
+        const response = await fetch(upstream.toString(), { signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS) });
+        const data = await response.json().catch(() => ({}));
+        res.statusCode = 200; // Google's own geocode endpoint reports errors via `status`, not HTTP code
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'private, max-age=300');
+        res.end(JSON.stringify(data));
+      } catch (error) {
+        res.statusCode = 502;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({ status: 'UNKNOWN_ERROR', error_message: error?.message || 'Geocoding request failed', results: [] }));
       }
     });
   }

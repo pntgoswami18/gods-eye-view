@@ -347,16 +347,19 @@ export const CANCELLED_SEARCH = Object.freeze({ cancelled: true });
  * default; precise landmarks/buildings use close landmark framing.
  */
 export async function searchAndFlyTo(viewer, query, options = {}) {
-  const apiKey = window.__GOOGLE_MAPS_API_KEY__ || import.meta.env.GOOGLE_MAPS_API_KEY;
-  if (!apiKey) throw new Error('No Google Maps API key available for geocoding');
-
   const beforeFly = typeof options.beforeFly === 'function' ? options.beforeFly : null;
   const mayFly = () => beforeFly === null || beforeFly() !== false;
 
   // Viewport-biased geocode — the same bias annotationResolver's geocodePlace uses:
   // "Sixth Street" spoken over Austin must prefer the Sixth Street on screen, not a
   // same-named road in another city (or the wrong end of town — the W 6th vs E 6th bug).
-  let url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(query)}&key=${apiKey}`;
+  //
+  // Proxied through the server (not called directly against
+  // maps.googleapis.com) because Google's Geocoding API rejects
+  // HTTP-referrer-restricted keys outright — it only accepts IP-restricted or
+  // unrestricted keys, unlike the client-side Map Tiles API this same key is
+  // also used for. See the /api/google/geocode handler in vite.config.js.
+  let url = `/api/google/geocode?address=${encodeURIComponent(query)}`;
   const bias = viewportBias(viewer);
   if (bias) url += `&bounds=${bias}`;
   const response = await fetch(url);
