@@ -3440,7 +3440,14 @@ const TFL_JAMCAM_URL = 'https://api.tfl.gov.uk/Place/Type/JamCam';
 const TFL_IMAGE_ORIGIN = 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/';
 const DEFAULT_TFL_MAX_SOURCES = 250;
 const LONDON_CENTER = { lat: 51.5074, lon: -0.1278 };
-/** Camera CATALOGS change rarely; 15 min keeps multi-megabyte upstream list refetches (Austin rows.json + 4 Caltrans districts + TfL) infrequent. Frames are fetched per-request and are unaffected. */
+/** NYC DOT TMC cameras: one keyless list endpoint; frames come from the same
+ * host per-camera (`/api/cameras/{id}/image`), unlike Austin/Caltrans which
+ * point at a separate image host. */
+const NYC_TMC_CAMERAS_URL = 'https://webcams.nyctmc.org/api/cameras';
+const NYC_TMC_IMAGE_ORIGIN = 'https://webcams.nyctmc.org/';
+const DEFAULT_NYC_MAX_SOURCES = 250;
+const NYC_CENTER = { lat: 40.7580, lon: -73.9855 }; // Times Square
+/** Camera CATALOGS change rarely; 15 min keeps multi-megabyte upstream list refetches (Austin rows.json + 4 Caltrans districts + TfL + NYC DOT) infrequent. Frames are fetched per-request and are unaffected. */
 const CCTV_SOURCE_CACHE_MS = 15 * 60 * 1000;
 /** Per-provider catalog-fetch timeout. Bounds the worst-case refresh so one
  * stalled upstream can't leave getCctvSources (and thus every CCTV route)
@@ -4066,6 +4073,77 @@ async function loadTflSourcesFromOpenData() {
 }
 
 /**
+ * Fetch NYC DOT TMC traffic cameras (all five boroughs). Keyless: one list
+ * endpoint returns every camera with an absolute per-camera image URL already
+ * on the official host — no ID-to-URL construction needed (unlike Austin/
+ * Caltrans). Only `isOnline === "true"` cameras with finite coords and an
+ * image URL on the official host are kept (official-host pin, same defense-
+ * in-depth rationale as Caltrans/TfL).
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+async function loadNycSourcesFromOpenData() {
+  try {
+    const resp = await fetch(NYC_TMC_CAMERAS_URL, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS) });
+    if (!resp.ok) {
+      console.warn('[CCTV] NYC DOT source download failed:', resp.status);
+      return [];
+    }
+    const records = await resp.json();
+    if (!Array.isArray(records)) return [];
+
+    const cameras = [];
+    for (const record of records) {
+      if (String(record?.isOnline).toLowerCase() !== 'true') continue;
+      const lat = toFiniteNumber(record?.latitude);
+      const lon = toFiniteNumber(record?.longitude);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+
+      const imageUrl = String(record?.imageUrl || '');
+      if (!imageUrl.startsWith(NYC_TMC_IMAGE_ORIGIN)) continue; // official-host pin
+
+      const rawId = String(record?.id || '').trim();
+      if (!rawId) continue;
+      const cameraId = `nyc-${rawId}`;
+
+      cameras.push({
+        id: cameraId,
+        name: String(record?.name || `NYC DOT Camera ${rawId}`),
+        city: String(record?.area || 'New York City'),
+        cityId: 'nyc',
+        provider: 'NYC DOT',
+        lat,
+        lon,
+        // No heading signal in the NYC TMC feed → id-hash fallback, low
+        // confidence personality (same as headingless TfL cameras).
+        headingDeg: fallbackHeadingFromId(cameraId),
+        headingConfidence: 'low',
+        pitchDeg: -18,
+        fovDeg: 44,
+        rangeM: 145,
+        mountHeightM: 8,
+        groundElevationM: 10, // NYC boroughs are near sea level; one-shot snap corrects.
+        feedType: 'image',
+        url: imageUrl,
+        snapshotUrl: imageUrl,
+        sourceKind: 'nyc-open-data',
+        license: 'Public NYC DOT traffic camera frame',
+      });
+    }
+
+    const unique = Array.from(new Map(cameras.map((camera) => [camera.id, camera])).values());
+    const maxRaw = Number(process.env.CCTV_NYC_MAX_SOURCES || DEFAULT_NYC_MAX_SOURCES);
+    const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(900, Math.floor(maxRaw))) : DEFAULT_NYC_MAX_SOURCES;
+    const prioritized = prioritizeSources(unique, maxCount, [NYC_CENTER]);
+    console.log(`[CCTV] Loaded NYC DOT camera sources: ${unique.length} online (using nearest ${prioritized.length})`);
+    return prioritized;
+  } catch (error) {
+    console.warn('[CCTV] NYC DOT source download error:', error?.message || error);
+    return [];
+  }
+}
+
+/**
  * Normalize a raw CCTV source item into a canonical shape with safe defaults.
  *
  * @param {object} item - Raw source from file, env, or Austin Open Data.
@@ -4104,9 +4182,9 @@ function normalizeSourceItem(item) {
 /**
  * Assemble and cache the merged CCTV source list.
  *
- * Merges sources from three origins (Austin Open Data, local file,
- * env variable), deduplicates by ID, applies the global max cap, and
- * caches for CCTV_SOURCE_CACHE_MS.
+ * Merges sources from live open-data packs (Austin, Caltrans, TfL, NYC DOT),
+ * a local file, and an env variable, deduplicates by ID, applies the global
+ * max cap, and caches for CCTV_SOURCE_CACHE_MS.
  *
  * @returns {Promise<Array<object>>} Deduplicated, capped source list.
  */
@@ -4141,22 +4219,26 @@ async function refreshCctvSources() {
   // Austin-only fetch, now governing all three. Each pack fails independently.
   const needsLiveSources = forceAustin || ((fromFile.length + fromEnv.length) === 0 && preferAustin);
   const tflEnabled = String(process.env.CCTV_TFL_ENABLED || '1').trim() !== '0';
+  const nycEnabled = String(process.env.CCTV_NYC_ENABLED || '1').trim() !== '0';
 
   let fromAustin = [];
   let fromCaltrans = [];
   let fromTfl = [];
+  let fromNyc = [];
   if (needsLiveSources) {
-    const [austinResult, caltransResult, tflResult] = await Promise.allSettled([
+    const [austinResult, caltransResult, tflResult, nycResult] = await Promise.allSettled([
       loadAustinSourcesFromOpenData(),
       loadCaltransSourcesFromOpenData(),
       tflEnabled ? loadTflSourcesFromOpenData() : Promise.resolve([]),
+      nycEnabled ? loadNycSourcesFromOpenData() : Promise.resolve([]),
     ]);
     fromAustin = austinResult.status === 'fulfilled' ? austinResult.value : [];
     fromCaltrans = caltransResult.status === 'fulfilled' ? caltransResult.value : [];
     fromTfl = tflResult.status === 'fulfilled' ? tflResult.value : [];
+    fromNyc = nycResult.status === 'fulfilled' ? nycResult.value : [];
   }
   // Live sources first so file/env overrides win on duplicate IDs (Map last-write).
-  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromFile, ...fromEnv];
+  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromNyc, ...fromFile, ...fromEnv];
 
   // Deduplicate by camera ID (last-write wins because of Map.set)
   const byId = new Map();
